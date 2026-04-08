@@ -94,6 +94,7 @@ sidebar = dbc.Card([
             {"label": "📊 Heatmap — % vs Non",          "value": "heatmap_pct"},
             {"label": "📈 Line chart",                   "value": "line"},
             {"label": "🏆 Top-N vs Non",                "value": "topn"},
+            {"label": "🥇 Best config per row vs Non",  "value": "best_per_row"},
             {"label": "🔢 Data table",                  "value": "table"},
             {"label": "📦 Box plot",                    "value": "box"},
             {"label": "🔵 Scatter plot",                "value": "scatter"},
@@ -213,6 +214,55 @@ sidebar = dbc.Card([
         ),
     ]),
 
+    # Best-per-row options
+    html.Div(id="bpr-options", children=[
+        html.Label("Rows fixed factor (Non shows best Non per row)",
+                   className="text-light fw-bold"),
+        dcc.RadioItems(
+            id="bpr-row-factor",
+            options=[
+                {"label": " Diameter  → best oblique+dev per row", "value": "diameter"},
+                {"label": " Oblique   → best diam+dev per row",    "value": "oblique"},
+                {"label": " Deviation → best oblique+diam per row","value": "dev"},
+            ],
+            value="diameter",
+            className="text-light mb-2",
+            inputStyle={"marginRight": "6px"},
+            labelStyle={"display": "block"},
+        ),
+        html.Label("Fix Deviation (or All)", className="text-light fw-bold"),
+        dcc.Dropdown(
+            id="bpr-fix-dev",
+            options=[{"label": "All deviations", "value": "__all__"}] +
+                    [{"label": d, "value": d} for d in ALL_DEVS],
+            value="__all__",
+            clearable=False,
+            className="mb-2",
+        ),
+        html.Label("Fix Oblique (or All)", className="text-light fw-bold"),
+        dcc.Dropdown(
+            id="bpr-fix-oblique",
+            options=[{"label": "All obliques", "value": "__all__"}] +
+                    [{"label": o, "value": o} for o in ALL_OBLIQUES],
+            value="__all__",
+            clearable=False,
+            className="mb-2",
+        ),
+        html.Label("Fix Diameter (or All)", className="text-light fw-bold"),
+        dcc.Dropdown(
+            id="bpr-fix-diam",
+            options=[{"label": "All diameters", "value": "__all__"}] +
+                    [{"label": str(d), "value": d} for d in ALL_DIAMETERS],
+            value="__all__",
+            clearable=False,
+            className="mb-2",
+        ),
+        html.Label("Cell font size", className="text-light fw-bold"),
+        dcc.Slider(id="bpr-cell-fs", min=6, max=16, step=1, value=9,
+                   marks={6:"6", 9:"9", 12:"12", 16:"16"},
+                   className="mb-3"),
+    ]),
+
     html.Hr(className="border-secondary"),
     html.Label("Sort rows", className="text-light fw-bold"),
     dcc.RadioItems(
@@ -322,14 +372,16 @@ app.layout = dbc.Container([
 @app.callback(
     Output("topn-options",    "style"),
     Output("scatter-options", "style"),
+    Output("bpr-options",     "style"),
     Input("chart-type", "value"),
 )
 def toggle_panels(chart_type):
     show   = {"display": "block"}
     hide   = {"display": "none"}
-    topn    = show if chart_type == "topn"    else hide
-    scatter = show if chart_type == "scatter" else hide
-    return topn, scatter
+    topn    = show if chart_type == "topn"         else hide
+    scatter = show if chart_type == "scatter"      else hide
+    bpr     = show if chart_type == "best_per_row" else hide
+    return topn, scatter, bpr
 
 
 @app.callback(
@@ -369,12 +421,19 @@ def update_info(obls, diams, devs):
     Input("font-size",      "value"),
     Input("fig-width",      "value"),
     Input("fig-height",     "value"),
+    Input("bpr-row-factor", "value"),
+    Input("bpr-fix-dev",    "value"),
+    Input("bpr-fix-oblique","value"),
+    Input("bpr-fix-diam",   "value"),
+    Input("bpr-cell-fs",    "value"),
 )
 def update_graph(chart_type, metrics, group_by,
                  f_obl, f_diam, f_dev, sort_by,
                  top_n, topn_group,
                  sc_x, sc_y, sc_color,
-                 font_size, fig_w, fig_h):
+                 font_size, fig_w, fig_h,
+                 bpr_row_factor, bpr_fix_dev, bpr_fix_oblique,
+                 bpr_fix_diam, bpr_cell_fs):
 
     # ── Filter ────────────────────────────────────────────────
     dff = df.copy()
@@ -390,6 +449,16 @@ def update_graph(chart_type, metrics, group_by,
         fig.update_layout(template="plotly_dark",
                           title="No data for current filters")
         return fig, None
+
+    layout_kw = dict(
+        template="plotly_dark",
+        font=dict(size=font_size),
+        width=fig_w,
+        height=fig_h,
+        margin=dict(l=120, r=80, t=60, b=100),
+        paper_bgcolor="#1e1e2e",
+        plot_bgcolor="#1e1e2e",
+    )
 
     # ── Build row labels ──────────────────────────────────────
     def get_grouped(dff, group_by):
@@ -735,19 +804,211 @@ def update_graph(chart_type, metrics, group_by,
                           title="Use the table below ↓")
         return fig, table
 
+    # ── BEST CONFIG PER ROW VS NON ────────────────────────────
+    elif chart_type == "best_per_row":
+        cols = metrics
+
+        # Apply fixed filters to working dataset (full df, not filtered dff)
+        dw = df.copy()
+        if bpr_fix_dev     != "__all__": dw = dw[dw["dev"]      == bpr_fix_dev]
+        if bpr_fix_oblique != "__all__": dw = dw[dw["oblique"]  == bpr_fix_oblique]
+        if bpr_fix_diam    != "__all__": dw = dw[dw["diameter"] == bpr_fix_diam]
+
+        # Row setup
+        if bpr_row_factor == "diameter":
+            row_vals   = sorted(dw["diameter"].unique())
+            row_labels = [f"d{int(v):02d}mm" for v in row_vals]
+            def cfg_lbl(r): return f"{r['oblique']} {r['dev']}"
+            def get_non_for_row(dw_, rv):
+                return dw_[(dw_["oblique"] == BASELINE_OBL) & (dw_["diameter"] == rv)]
+            def get_cands_for_row(dw_, rv):
+                return dw_[(dw_["oblique"] != BASELINE_OBL) & (dw_["diameter"] == rv)]
+
+        elif bpr_row_factor == "oblique":
+            row_vals   = [o for o in OBLIQUE_NAMES
+                          if o in dw["oblique"].unique() and o != BASELINE_OBL]
+            row_labels = list(row_vals)
+            def cfg_lbl(r): return f"d{int(r['diameter']):02d}mm {r['dev']}"
+            def get_non_for_row(dw_, rv):
+                return dw_[dw_["oblique"] == BASELINE_OBL]
+            def get_cands_for_row(dw_, rv):
+                return dw_[(dw_["oblique"] == rv) & (dw_["oblique"] != BASELINE_OBL)]
+
+        else:  # dev
+            row_vals   = [d for d in DEV_CONFIG_NAMES if d in dw["dev"].unique()]
+            row_labels = list(row_vals)
+            def cfg_lbl(r): return f"{r['oblique']} d{int(r['diameter']):02d}mm"
+            def get_non_for_row(dw_, rv):
+                return dw_[(dw_["oblique"] == BASELINE_OBL) & (dw_["dev"] == rv)]
+            def get_cands_for_row(dw_, rv):
+                return dw_[(dw_["oblique"] != BASELINE_OBL) & (dw_["dev"] == rv)]
+
+        all_rows  = [f"{BASELINE_OBL} (best)"] + row_labels
+        n_r, n_c  = len(all_rows), len(cols)
+
+        val_mat      = np.full((n_r, n_c), np.nan)
+        pct_mat      = np.zeros((n_r, n_c))
+        imp_mat      = np.zeros((n_r, n_c))
+        text_mat     = [[""] * n_c for _ in range(n_r)]
+        non_best_val = np.full(n_c, np.nan)
+
+        # ── Row 0: best Non per metric (global best Non) ──────
+        non_all = dw[dw["oblique"] == BASELINE_OBL]
+        for j, col in enumerate(cols):
+            if non_all.empty or col not in non_all.columns:
+                text_mat[0][j] = "—"
+                continue
+            ascending = col in ASCENDING_METRICS
+            if ascending:
+                best_idx = non_all[col].idxmin()
+            else:
+                best_idx = non_all[col].idxmax()
+            best_row  = non_all.loc[best_idx]
+            best_val  = float(best_row[col])
+            non_best_val[j] = best_val
+            val_mat[0, j]   = best_val
+            if bpr_row_factor == "dev":
+                ctx = f"{best_row['oblique']} d{int(best_row['diameter']):02d}mm"
+            else:
+                ctx = f"d{int(best_row['diameter']):02d}mm {best_row['dev']}"
+            text_mat[0][j] = f"<b>{best_val:.3g}</b><br>(best Non)<br>({ctx})"
+
+        # ── Rows 1..N: best non-Non config per row value ──────
+        for i, (rv, rl) in enumerate(zip(row_vals, row_labels), 1):
+            non_rv = get_non_for_row(dw, rv)
+            cands  = get_cands_for_row(dw, rv)
+
+            for j, col in enumerate(cols):
+                ascending = col in ASCENDING_METRICS
+
+                if not non_rv.empty and col in non_rv.columns:
+                    if ascending:
+                        ref_idx = non_rv[col].idxmin()
+                    else:
+                        ref_idx = non_rv[col].idxmax()
+                    base_val = float(non_rv.loc[ref_idx, col])
+                else:
+                    base_val = float(non_best_val[j]) if not np.isnan(non_best_val[j]) else np.nan
+
+                if cands.empty or col not in cands.columns or np.isnan(base_val):
+                    text_mat[i][j] = "—"
+                    continue
+
+                if abs(base_val) > 1e-12:
+                    raw_pct = (cands[col] - base_val) / abs(base_val) * 100
+                    imp_ser = -raw_pct if ascending else raw_pct
+                else:
+                    raw_pct = pd.Series(np.zeros(len(cands)), index=cands.index)
+                    imp_ser = raw_pct.copy()
+
+                best_idx = imp_ser.idxmax()
+                best_row = cands.loc[best_idx]
+                best_val = float(best_row[col])
+                best_pct = float(raw_pct[best_idx])
+                best_imp = float(imp_ser[best_idx])
+                cfg      = cfg_lbl(best_row)
+
+                val_mat[i, j]  = best_val
+                pct_mat[i, j]  = best_pct
+                imp_mat[i, j]  = best_imp
+                sign = "+" if best_pct >= 0 else ""
+                text_mat[i][j] = (
+                    f"<b>{best_val:.3g}</b><br>"
+                    f"({sign}{best_pct:.1f}%)<br>"
+                    f"({cfg})"
+                )
+
+        # ── Normalize color ───────────────────────────────────
+        norm_mat = np.full((n_r, n_c), 0.5)
+
+        # Non ref row: color based on Non quality across row_vals
+        non_row_vals = np.zeros((len(row_vals), n_c))
+        for i, rv in enumerate(row_vals):
+            non_rv = get_non_for_row(dw, rv)
+            for j, col in enumerate(cols):
+                if not non_rv.empty and col in non_rv.columns:
+                    non_row_vals[i, j] = float(non_rv[col].mean())
+
+        for j, col in enumerate(cols):
+            col_vals = non_row_vals[:, j]
+            vmin, vmax = np.nanmin(col_vals), np.nanmax(col_vals)
+            if vmax - vmin > 1e-12:
+                nc = (col_vals - vmin) / (vmax - vmin)
+                norm_mat[0, j] = float(np.nanmax(1 - nc if col in ASCENDING_METRICS else nc))
+            else:
+                norm_mat[0, j] = 0.5
+
+        # Candidate rows: based on improvement score
+        for j in range(n_c):
+            mx = float(np.nanmax(np.abs(imp_mat[1:, j])))
+            if mx > 1e-9:
+                norm_mat[1:, j] = np.clip(imp_mat[1:, j] / mx * 0.5 + 0.5, 0.0, 1.0)
+
+        # ── Gold borders for cells better than Non ────────────
+        shapes = [dict(
+            type="line",
+            x0=-0.5, x1=n_c - 0.5,
+            y0=0.5,  y1=0.5,
+            line=dict(color="white", width=3, dash="dash"),
+        )]
+        for i_r in range(len(row_vals)):
+            for j_c in range(n_c):
+                if imp_mat[i_r + 1, j_c] > 0:
+                    shapes.append(dict(
+                        type="rect",
+                        x0=j_c - 0.48, x1=j_c + 0.48,
+                        y0=(i_r + 1) - 0.48, y1=(i_r + 1) + 0.48,
+                        line=dict(color="#F5D547", width=2.5),
+                        fillcolor="rgba(0,0,0,0)",
+                    ))
+
+        fix_parts = []
+        if bpr_fix_dev     != "__all__": fix_parts.append(f"dev={bpr_fix_dev}")
+        if bpr_fix_oblique != "__all__": fix_parts.append(f"obl={bpr_fix_oblique}")
+        if bpr_fix_diam    != "__all__": fix_parts.append(f"d={bpr_fix_diam}mm")
+        fix_str = " | " + ", ".join(fix_parts) if fix_parts else ""
+
+        cell_fs = bpr_cell_fs or 9
+
+        fig = go.Figure()
+        fig.add_trace(go.Heatmap(
+            z=norm_mat,
+            x=cols,
+            y=all_rows,
+            text=text_mat,
+            texttemplate="%{text}",
+            textfont=dict(size=cell_fs),
+            colorscale=PLOTLY_CMAP,
+            zmin=0, zmax=1,
+            colorbar=dict(
+                title="Score",
+                tickvals=[0, 0.5, 1],
+                ticktext=["Worse", "Mid", "Better"],
+                tickfont=dict(size=font_size),
+            ),
+            hoverongaps=False,
+            hovertemplate="<b>%{y}</b><br><b>%{x}</b><br>%{text}<extra></extra>",
+        ))
+        fig.update_layout(
+            shapes=shapes,
+            title=dict(
+                text=(f"Best config vs Non (best Non shown) | "
+                      f"rows={bpr_row_factor}{fix_str}"),
+                font=dict(size=font_size + 4, color="white"),
+            ),
+            xaxis=dict(title="Metric", tickfont=dict(size=font_size), side="bottom"),
+            yaxis=dict(title=bpr_row_factor.capitalize(),
+                       tickfont=dict(size=font_size), autorange="reversed"),
+            **layout_kw,
+        )
+        fig.update_xaxes(tickangle=-45, tickfont=dict(size=max(font_size-2, 8)))
+        return fig, None
+
     else:
         fig = go.Figure()
 
     # ── Common layout ─────────────────────────────────────────
-    fig.update_layout(
-        template="plotly_dark",
-        font=dict(size=font_size),
-        width=fig_w,
-        height=fig_h,
-        margin=dict(l=120, r=80, t=60, b=100),
-        paper_bgcolor="#1e1e2e",
-        plot_bgcolor="#1e1e2e",
-    )
+    fig.update_layout(**layout_kw)
     fig.update_xaxes(tickangle=-45, tickfont=dict(size=max(font_size-2, 8)))
     fig.update_yaxes(tickfont=dict(size=max(font_size-2, 8)))
 
